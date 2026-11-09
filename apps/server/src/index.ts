@@ -81,7 +81,9 @@ import { consumeTikzRateLimit, renderTikzSvg, TikzRenderError, validateTikzCode 
 import { membershipDetails } from './membership.js';
 import { earnPoints, computeScorePoints, computeStarBonus, getCurrencyStatus, redeemMembershipWithPoints, listLedger, CURRENCY_PRODUCTS, claimDailyLogin, beijingDateStr } from './currency.js';
 import { createMembershipCheckout, handleWaffoWebhook, isWaffoEnabled, listPurchasablePlans, listPaymentOrders, manageSubscription, reconcileMembership } from './waffo.js';
-import { initQuestionPool, getPooledQuestion, getPooledQuestions } from './game.js';
+import { initQuestionPool, getPooledQuestion, getPooledQuestions, purgeOldGameData } from './game.js';
+import { finishGameSession, getGameStats, getLeaderboard, getRecentSessions, getDailyChallenge, getStageProgress, getAllStageProgress } from './game-store.js';
+import { GAME_DAILY_SIZE, GAME_STAGE_SIZE } from '@boen/shared';
 
 // 从仓库根加载 .env
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -2373,7 +2375,7 @@ app.post('/api/answer', async (c) => {
 });
 
 // ── 教育游戏 ─────────────────────────────────────────
-import { GameQuestionSchema } from './validation.js';
+import { GameQuestionSchema, GameBatchQuerySchema, GameFinishSchema, GameLeaderboardQuerySchema } from './validation.js';
 
 /* ── 通用限流工具 ── */
 const RATE_LIMIT_MAX_ENTRIES = 10000;
@@ -2417,6 +2419,30 @@ function checkRateLimit(key: string, maxRequests: number, windowMs: number): boo
   return recent.length <= maxRequests;
 }
 
+/**
+ * 游戏出题的「个性化上下文」：取当前用户的薄弱知识点，作为优先出题主题。
+ * 未登录 / 无画像时返回空数组，退化为「按年级随机知识点」出题。
+ */
+async function gameWeakKgNodeIds(userId: string | null, subject: string, grade?: string): Promise<number[]> {
+  if (!userId) return [];
+  try {
+    return getWeakPoints(userId, subject, grade, 60, 8).map((p) => p.kgNodeId);
+  } catch (err) {
+    console.warn('[game] 薄弱点读取失败:', err instanceof Error ? err.message : String(err));
+    return [];
+  }
+}
+
+/** 解析游戏查询参数（缺失字段走 schema 默认值，非法值降级而非报错） */
+function parseGameQuery(c: Context, keys: readonly string[]): Record<string, string> {
+  const raw: Record<string, string> = {};
+  for (const k of keys) {
+    const v = c.req.query(k);
+    if (v) raw[k] = v;
+  }
+  return raw;
+}
+
 /** GET /api/game/question — 获取一道游戏用选择题（优先从题目池秒出） */
 app.get('/api/game/question', async (c) => {
   const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
@@ -2425,11 +2451,13 @@ app.get('/api/game/question', async (c) => {
   }
 
   try {
-    const raw = { subject: c.req.query('subject') || 'math' };
-    const parsed = GameQuestionSchema.safeParse(raw);
-    const subject: string = parsed.success ? parsed.data.subject : 'math';
-    if (!parsed.success) console.warn('[game] 非法 subject 参数，降级为 math');
-    const question = getPooledQuestion(subject);
+    const parsed = GameQuestionSchema.safeParse(parseGameQuery(c, ['subject', 'grade']));
+    if (!parsed.success) console.warn('[game] 出题参数不合法，已降级为默认学科/年级');
+    const subject = parsed.success ? parsed.data.subject : 'math';
+    const grade = parsed.success ? parsed.data.grade : undefined;
+    const userId = await resolveUserId(c);
+    const preferKgNodeIds = await gameWeakKgNodeIds(userId, subject, grade);
+    const question = getPooledQuestion(subject, { userId, grade, mode: 'endless', preferKgNodeIds });
     return c.json({ question });
   } catch (err) {
     console.error('[game] 出题失败:', sanitizeError(err));
@@ -2440,14 +2468,20 @@ app.get('/api/game/question', async (c) => {
 /** GET /api/game/questions — 批量获取游戏选择题 */
 app.get('/api/game/questions', async (c) => {
   const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
-  if (!checkRateLimit(`rate:game:batch:${clientIp}`, 3, 1000)) {
+  // 一次拉 5 题、切学科会重拉：3 次/秒太紧（实测会被自己的请求打到 429），放宽到 8 次/秒
+  if (!checkRateLimit(`rate:game:batch:${clientIp}`, 8, 1000)) {
     return c.json({ error: '请求过于频繁，请稍后再试' }, 429);
   }
 
   try {
-    const subject = c.req.query('subject') || 'math';
-    const count = Math.min(Math.max(Number(c.req.query('count')) || 5, 1), 10);
-    const questions = getPooledQuestions(subject, count);
+    const parsed = GameBatchQuerySchema.safeParse(parseGameQuery(c, ['subject', 'grade', 'count']));
+    if (!parsed.success) console.warn('[game] 批量出题参数不合法，已降级为默认学科/年级');
+    const subject = parsed.success ? parsed.data.subject : 'math';
+    const grade = parsed.success ? parsed.data.grade : undefined;
+    const count = parsed.success ? parsed.data.count : 5;
+    const userId = await resolveUserId(c);
+    const preferKgNodeIds = await gameWeakKgNodeIds(userId, subject, grade);
+    const questions = getPooledQuestions(subject, count, { userId, grade, mode: 'endless', preferKgNodeIds });
     return c.json({ questions });
   } catch (err) {
     console.error('[game] 批量出题失败:', sanitizeError(err));
@@ -2455,10 +2489,120 @@ app.get('/api/game/questions', async (c) => {
   }
 });
 
+/** POST /api/game/finish — 局末结算：落库 + 回写知识点熟练度 + 发放积分 */
+app.post('/api/game/finish', async (c) => {
+  const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+  // 一局最多打几十分钟，10 次/分钟足够正常游玩，也挡住批量刷分
+  if (!checkRateLimit(`rate:game:finish:${clientIp}`, 10, 60_000)) {
+    return c.json({ error: '请求过于频繁，请稍后再试' }, 429);
+  }
+
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_json' }, 400); }
+
+  const parsed = GameFinishSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'invalid_payload', detail: parsed.error.issues[0]?.message }, 400);
+  }
+
+  try {
+    const result = finishGameSession({ userId, ...parsed.data });
+    return c.json({ ok: true, ...result, stats: getGameStats(userId) });
+  } catch (err) {
+    console.error('[game] 结算失败:', sanitizeError(err));
+    return c.json({ error: '结算失败，请稍后重试' }, 500);
+  }
+});
+
+/** GET /api/game/leaderboard — 排行榜（匿名昵称，标注「我」） */
+app.get('/api/game/leaderboard', async (c) => {
+  const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+  if (!checkRateLimit(`rate:game:board:${clientIp}`, 20, 60_000)) {
+    return c.json({ error: '请求过于频繁，请稍后再试' }, 429);
+  }
+
+  try {
+    const parsed = GameLeaderboardQuerySchema.safeParse(parseGameQuery(c, ['subject', 'period']));
+    const period = parsed.success ? parsed.data.period : 'week';
+    const subject = parsed.success ? parsed.data.subject ?? null : null;
+    const userId = await resolveUserId(c);
+    return c.json({ period, rows: getLeaderboard(userId, subject, period, 20) });
+  } catch (err) {
+    console.error('[game] 排行榜读取失败:', sanitizeError(err));
+    return c.json({ error: '排行榜读取失败' }, 500);
+  }
+});
+
+/** GET /api/game/stats — 个人战绩 + 最近 10 局 */
+app.get('/api/game/stats', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+  try {
+    return c.json({ stats: getGameStats(userId), recent: getRecentSessions(userId, 10), stages: getAllStageProgress(userId) });
+  } catch (err) {
+    console.error('[game] 战绩读取失败:', sanitizeError(err));
+    return c.json({ error: '战绩读取失败' }, 500);
+  }
+});
+
+/** GET /api/game/daily — 每日挑战：当天固定的题集（刷新不换题） */
+app.get('/api/game/daily', async (c) => {
+  const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+  if (!checkRateLimit(`rate:game:daily:${clientIp}`, 20, 60_000)) {
+    return c.json({ error: '请求过于频繁，请稍后再试' }, 429);
+  }
+
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  try {
+    const parsed = GameQuestionSchema.safeParse(parseGameQuery(c, ['subject', 'grade']));
+    const subject = parsed.success ? parsed.data.subject : 'math';
+    const grade = parsed.success ? parsed.data.grade : undefined;
+    const preferKgNodeIds = await gameWeakKgNodeIds(userId, subject, grade);
+    const result = getDailyChallenge(userId, subject, () =>
+      getPooledQuestions(subject, GAME_DAILY_SIZE, { userId, grade, mode: 'daily', preferKgNodeIds }));
+    return c.json(result);
+  } catch (err) {
+    console.error('[game] 每日挑战读取失败:', sanitizeError(err));
+    return c.json({ error: '每日挑战读取失败' }, 500);
+  }
+});
+
+/** GET /api/game/stage — 关卡进度 + 本关题目（每关 5 题，答对 4 题过关） */
+app.get('/api/game/stage', async (c) => {
+  const clientIp = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+  if (!checkRateLimit(`rate:game:stage:${clientIp}`, 20, 60_000)) {
+    return c.json({ error: '请求过于频繁，请稍后再试' }, 429);
+  }
+
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  try {
+    const parsed = GameQuestionSchema.safeParse(parseGameQuery(c, ['subject', 'grade']));
+    const subject = parsed.success ? parsed.data.subject : 'math';
+    const grade = parsed.success ? parsed.data.grade : undefined;
+    const preferKgNodeIds = await gameWeakKgNodeIds(userId, subject, grade);
+    const progress = getStageProgress(userId, subject);
+    const questions = getPooledQuestions(subject, GAME_STAGE_SIZE, { userId, grade, mode: 'stage', preferKgNodeIds });
+    return c.json({ progress, questions });
+  } catch (err) {
+    console.error('[game] 关卡读取失败:', sanitizeError(err));
+    return c.json({ error: '关卡读取失败' }, 500);
+  }
+});
+
 const port = Number(process.env.PORT ?? 8787);
 const retentionTimer = setInterval(() => {
   try { runPrivacyRetention(db, ASSET_ROOT, join(DATA_DIR, 'backups')); }
   catch (error: unknown) { console.error('[privacy] retention failed:', error instanceof Error ? error.message : 'unknown'); }
+  // 出题账本只保留 24 小时；冷题目缓存与过期每日挑战一并清理
+  try { purgeOldGameData(); }
+  catch (error: unknown) { console.error('[game] 清理失败:', error instanceof Error ? error.message : 'unknown'); }
 }, 60 * 60 * 1000);
 retentionTimer.unref();
 serve({ fetch: app.fetch, port });

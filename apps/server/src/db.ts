@@ -200,6 +200,15 @@ const MIGRATIONS: Array<{ version: number; run: () => void; description: string 
       db.exec(`UPDATE exam_sessions SET updated_at = COALESCE(created_at, unixepoch()) WHERE updated_at = 0`);
     },
   },
+  {
+    version: 6,
+    description: 'game_sessions 添加 mode 列（无尽 / 每日挑战 / 关卡）',
+    run: () => {
+      // 该表在文件末尾才创建；全新库此时还不存在，跳过即可（建表语句已带该列）
+      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='game_sessions'").get();
+      if (exists) addColumnIfNotExists('game_sessions', 'mode', "TEXT NOT NULL DEFAULT 'endless'");
+    },
+  },
 ];
 
 for (const m of MIGRATIONS) {
@@ -555,6 +564,94 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_cs_user_subject ON conversation_summaries(user_id, subject);
   CREATE INDEX IF NOT EXISTS idx_cs_created ON conversation_summaries(created_at DESC);
+`);
+
+// ── 教育游戏：局记录 ──────────────────────────
+// 一局一行。answers 存 JSON 数组 [{questionId, kgNodeId?, correct}]，
+// 局末据此回写 user_kp_proficiency（Elo），让游戏结果反哺学习画像。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS game_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    grade TEXT,
+    score INTEGER NOT NULL DEFAULT 0,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    correct_count INTEGER NOT NULL DEFAULT 0,
+    max_combo INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    answers TEXT NOT NULL DEFAULT '[]',
+    points_awarded INTEGER NOT NULL DEFAULT 0,
+    client_kind TEXT NOT NULL DEFAULT 'web',
+    mode TEXT NOT NULL DEFAULT 'endless',
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE INDEX IF NOT EXISTS idx_game_user ON game_sessions(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_game_board ON game_sessions(subject, created_at, correct_count DESC);
+`);
+
+// 出题账本：服务端签发过的题目（含正确答案），结算时据此核对，不信任客户端上报。
+// 保留 24 小时后由定期任务清理。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS game_question_issue (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    subject TEXT NOT NULL,
+    grade TEXT,
+    mode TEXT NOT NULL DEFAULT 'endless',
+    stem TEXT NOT NULL,
+    options TEXT NOT NULL,
+    correct_key TEXT NOT NULL,
+    explain TEXT,
+    kg_node_id INTEGER,
+    issued_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    consumed_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_gqi_user ON game_question_issue(user_id, issued_at);
+  CREATE INDEX IF NOT EXISTS idx_gqi_issued ON game_question_issue(issued_at);
+`);
+
+// 题目缓存：LLM 生成过的题落库，重启/多进程都能复用，避免重复烧 token。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS game_question_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL UNIQUE,
+    subject TEXT NOT NULL,
+    grade TEXT,
+    stem TEXT NOT NULL,
+    options TEXT NOT NULL,
+    correct_key TEXT NOT NULL,
+    explain TEXT,
+    kg_node_id INTEGER,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE INDEX IF NOT EXISTS idx_gqc_pick ON game_question_cache(subject, grade, used_count);
+`);
+
+// 每日挑战：当天的题集固定下来，刷新页面不会换题。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS game_daily_challenges (
+    user_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    questions TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (user_id, date)
+  );
+`);
+
+// 关卡进度：每学科一条，关卡制用。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS game_progress (
+    user_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    stage INTEGER NOT NULL DEFAULT 1,
+    cleared_stages INTEGER NOT NULL DEFAULT 0,
+    best_accuracy INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (user_id, subject)
+  );
 `);
 
 initMembership(db);

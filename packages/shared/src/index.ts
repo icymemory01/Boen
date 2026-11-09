@@ -557,3 +557,41 @@ export type SseEvent =
   | { type: 'settlement'; summary: string; score: number; stepsCompleted: number; totalSteps: number; updatedKps: number; proficiencyChanges?: Array<{ kpTitle: string; before: number; after: number }>; pointsEarned?: number; pointsBalance?: number; pointsCapped?: boolean }
   | { type: 'done' }
   | { type: 'error'; message: string };
+
+/* ══════════════════════════════════════════════════════════════
+ * 教育游戏（知识跑酷）——前后端共享常量
+ *
+ * 学科表、跑道数、计分与关卡规则只在这一处定义：
+ * 服务端出题、前端选科卡片、跑酷场景都从这里取，避免三处硬编码各自漂移。
+ * ══════════════════════════════════════════════════════════════ */
+
+export const GAME_SUBJECTS = ['math', 'chinese', 'english', 'science'] as const;
+export type GameSubject = (typeof GAME_SUBJECTS)[number];
+
+/** 学科展示信息（选科卡片、主题色、Emoji） */
+export const GAME_SUBJECT_META: Record<GameSubject, {
+  label: string;
+  emoji: string;
+  desc: string;
+  accent: string;
+  accentSoft: string;
+  accentStrong: string;
+}> = {
+  math: { label: '数学', emoji: '🔢', desc: '数与运算、几何、逻辑', accent: '#14b48a', accentSoft: '#d9f4ec', accentStrong: '#0e9b76' },
+  chinese: { label: '语文', emoji: '📖', desc: '古诗、阅读理解、字词', accent: '#ff7a4d', accentSoft: '#ffe5d7', accentStrong: '#e06530' },
+  english: { label: '英语', emoji: '🔤', desc: '词汇、语法、日常对话', accent: '#6c5ce7', accentSoft: '#e8e4ff', accentStrong: '#5a4bd1' },
+  science: { label: '科学', emoji: '🔬', desc: '物理、生物、天文常识', accent: '#3498db', accentSoft: '#d4e6f1', accentStrong: '#2c7bc7' },
+};
+
+/** 跑酷跑道数 = 每道题的选项数 */
+export const GAME_LANES = 4;
+/** 答对一题的基础分（服务端按同一常量重算，不信任客户端上报） */
+export const GAME_QUESTION_BONUS = 10;
+/** 关卡模式：每关题数与过关所需正确数 */
+export const GAME_STAGE_SIZE = 5;
+export const GAME_STAGE_PASS = 4;
+/** 每日挑战题数 */
+export const GAME_DAILY_SIZE = 10;
+
+/** 游戏局类型 */
+export type GameMode = 'endless' | 'daily' | 'stage';

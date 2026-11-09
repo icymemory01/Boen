@@ -1,297 +1,536 @@
 /**
- * 教育游戏 —— 知识跑酷：单题出题接口
+ * game.ts —— 知识跑酷：出题引擎（题目池 + LLM 生成 + 课程知识点选题 + 出题账本）
  *
- * 按学科出题，支持 LLM 生成 + 内置兜底题库。
+ * 纯逻辑（解析 / 洗牌 / 题库）在 game-core.ts，可脱离数据库单测；
+ * 这里负责「选知识点 → 调模型 → 分池预热 → 记下签发过的题」。
+ *
+ * **出题账本**是本模块的安全基石：每道题发给学生前先落库正确答案，
+ * 结算时按 questionId 重新核对，客户端上报的分数一律不采信。
  */
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { SystemMessage, HumanMessage } from '@langchain/core/messages';
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { GAME_QUESTION_BONUS, type GameMode } from '@boen/shared';
+import db from './db.js';
+import {
+  LANE_COUNT,
+  gradeLabel,
+  parseLLMQuestion,
+  shuffleByIndex,
+  getFallbackQuestion,
+  newQuestionId,
+  registerExtraBank,
+  normalizeSubject,
+  type GameQuestion,
+  type GameSubject,
+} from './game-core.js';
 
-export interface GameQuestion {
+export * from './game-core.js';
+
+/** 一道题的签发上下文 */
+export interface IssueContext {
+  userId?: string | null;
+  grade?: string;
+  mode?: GameMode;
+  preferKgNodeIds?: number[];
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 出题账本：记录签发过的题（含正确答案），供结算核对
+ * ══════════════════════════════════════════════════════════════ */
+
+function recordIssue(q: GameQuestion, subject: GameSubject, ctx: IssueContext): void {
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO game_question_issue
+        (id, user_id, subject, grade, mode, stem, options, correct_key, explain, kg_node_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      q.id, ctx.userId ?? null, subject, ctx.grade ?? null, ctx.mode ?? 'endless',
+      q.stem, JSON.stringify(q.options), q.correctKey, q.explain ?? null, q.kgNodeId ?? null,
+    );
+  } catch (e) {
+    // 记账失败不影响出题；只是这道题结算时会被判为「未核验」而不计分
+    console.warn('[game] 出题记账失败:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+export interface SubmittedAnswer {
+  questionId: string;
+  /** 学生撞上的选项 key（A/B/C/D）。缺省则无法核验 */
+  chosenKey?: string;
+}
+
+export interface VerifiedAnswer {
+  questionId: string;
+  correct: boolean;
+  kgNodeId?: number;
+  stem: string;
+  correctText: string;
+  chosenText?: string;
+  explain?: string;
+}
+
+export interface VerifyResult {
+  answers: VerifiedAnswer[];
+  correctCount: number;
+  maxCombo: number;
+  totalQuestions: number;
+  /** 服务端重算的分数（不采信客户端） */
+  score: number;
+  /** 账本里查不到、被判为未核验的题数 */
+  unverified: number;
+}
+
+interface IssueRow {
   id: string;
+  subject: string;
   stem: string;
-  options: { key: string; text: string }[];
-  correctKey: string;
+  options: string;
+  correct_key: string;
+  explain: string | null;
+  kg_node_id: number | null;
 }
 
-/** LLM 返回的原始题目 JSON 结构 */
-interface RawQuestionJson {
-  stem: string;
-  options: { key: string; text: string }[];
-  correctKey: string;
+function parseOptions(json: string): Array<{ key: string; text: string }> {
+  try {
+    const arr = JSON.parse(json) as Array<{ key?: unknown; text?: unknown }>;
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((o) => typeof o?.key === 'string' && typeof o?.text === 'string')
+      .map((o) => ({ key: String(o.key), text: String(o.text) }));
+  } catch {
+    return [];
+  }
 }
-
-const SUBJECT_MAP: Record<string, { label: string }> = {
-  math: { label: '数学' },
-  chinese: { label: '语文' },
-  english: { label: '英语' },
-  science: { label: '科学' },
-};
-
-/** LLM 调用超时（毫秒）*/
-const LLM_TIMEOUT = 2000;
-
-/* ── 题目池：内存预生成，请求时秒出 ── */
-const questionPools = new Map<string, GameQuestion[]>();
-const poolRefilling = new Map<string, boolean>();
-let poolModel: BaseChatModel | null = null;
-const POOL_MIN = 5;   // 低于此数时后台补充
-const POOL_MAX = 20;  // 补充到此数
 
 /**
- * 解析 LLM 返回文本为 GameQuestion
- * 返回 null 表示解析失败，调用方应降级
+ * 按出题账本核验作答：正确答案、对错、连击、分数全部由服务端重算。
+ * 账本里没有的题目（伪造 / 超过 24 小时 / 换了进程且未落库）不计分。
  */
-function parseLLMQuestion(text: string): GameQuestion | null {
-  if (!text) return null;
+export function verifySubmittedAnswers(subject: GameSubject, submitted: SubmittedAnswer[]): VerifyResult {
+  const unique = [...new Set(submitted.map((a) => a.questionId).filter((id) => typeof id === 'string' && id))];
+  const rows = new Map<string, IssueRow>();
 
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    console.warn('[game] LLM 返回内容不含有效 JSON');
-    return null;
+  // SQLite 变量上限约 999，分块查询
+  for (let i = 0; i < unique.length; i += 90) {
+    const chunk = unique.slice(i, i + 90);
+    if (chunk.length === 0) continue;
+    const placeholders = chunk.map(() => '?').join(',');
+    const found = db.prepare(`
+      SELECT id, subject, stem, options, correct_key, explain, kg_node_id
+      FROM game_question_issue WHERE id IN (${placeholders})
+    `).all(...chunk) as IssueRow[];
+    for (const r of found) rows.set(r.id, r);
   }
 
-  let parsed: RawQuestionJson;
-  try {
-    parsed = JSON.parse(jsonMatch[0]) as RawQuestionJson;
-  } catch {
-    console.warn('[game] LLM 返回 JSON 解析失败');
-    return null;
-  }
+  const answers: VerifiedAnswer[] = [];
+  let maxCombo = 0;
+  let streak = 0;
+  let unverified = 0;
 
-  // 校验必需字段
-  if (!parsed.stem || !Array.isArray(parsed.options) || parsed.options.length < 2 || !parsed.correctKey) {
-    console.warn('[game] LLM 返回题目缺少必需字段');
-    return null;
-  }
-
-  // 补充/截断选项到 4 个
-  if (parsed.options.length < 4) {
-    console.warn(`[game] LLM 返回选项不足 (${parsed.options.length})，补足到 4 个`);
-    const placeholders = ['此选项无效', '此选项无效', '此选项无效', '此选项无效'];
-    for (let i = parsed.options.length; i < 4; i++) {
-      parsed.options.push({ key: String.fromCharCode(65 + i), text: placeholders[i] });
+  for (const item of submitted) {
+    const row = rows.get(item.questionId);
+    const chosenKey = typeof item.chosenKey === 'string' ? item.chosenKey.trim().toUpperCase() : '';
+    // 题目不存在、学科不符、没给所选项 → 一律不采信
+    if (!row || row.subject !== subject || !chosenKey) {
+      unverified++;
+      continue;
     }
+    const options = parseOptions(row.options);
+    const correct = chosenKey === row.correct_key.toUpperCase();
+    if (correct) {
+      streak++;
+      maxCombo = Math.max(maxCombo, streak);
+    } else {
+      streak = 0;
+    }
+    answers.push({
+      questionId: row.id,
+      correct,
+      kgNodeId: row.kg_node_id ?? undefined,
+      stem: row.stem,
+      correctText: options.find((o) => o.key === row.correct_key)?.text ?? '',
+      chosenText: options.find((o) => o.key === chosenKey)?.text ?? '',
+      explain: row.explain ?? undefined,
+    });
   }
 
-  // 归一化 correctKey 为大写
-  parsed.correctKey = parsed.correctKey.toUpperCase().trim();
-  if (!/^[A-D]$/.test(parsed.correctKey)) {
-    parsed.correctKey = 'A'; // 无效 key 降级为 A
-  }
-
-  // 找到正确答案在原始顺序中的索引
-  const correctIndex = parsed.options.findIndex(o => o.key === parsed.correctKey);
-  const safeCorrectIndex = correctIndex >= 0 ? correctIndex : 0;
-
-  // 重写 key 为 A/B/C/D（按原始顺序），只取前 4 个
-  const options = parsed.options.slice(0, 4).map((o, i) => ({
-    key: String.fromCharCode(65 + i),
-    text: String(o.text ?? '').trim() || '（空选项）',
-  }));
-
-  // 安全检查：options 必须至少 2 项
-  if (options.length < 2) return null;
-
-  // 打乱选项并定位正确答案
-  const { shuffled, newCorrectKey } = shuffleOptionsAndLocateCorrect(options, options[safeCorrectIndex]?.key ?? 'A');
-
+  const correctCount = answers.filter((a) => a.correct).length;
   return {
-    id: `q_${Date.now()}_${randomUUID().slice(0, 6)}`,
-    stem: parsed.stem.trim() || '请选择正确答案',
-    options: shuffled,
-    correctKey: newCorrectKey,
+    answers,
+    correctCount,
+    maxCombo,
+    totalQuestions: answers.length,
+    score: correctCount * GAME_QUESTION_BONUS,
+    unverified,
   };
 }
 
-/** 按学科出题 */
-export async function generateGameQuestion(model: BaseChatModel, subject: string): Promise<GameQuestion> {
-  const sub = SUBJECT_MAP[subject];
-  if (!sub) return getFallbackQuestion(subject);
+/** 清理过期账本与冷缓存（由服务端定时任务调用） */
+export function purgeOldGameData(nowSec = Math.floor(Date.now() / 1000)): { issues: number; cache: number } {
+  try {
+    const issues = db.prepare('DELETE FROM game_question_issue WHERE issued_at < ?').run(nowSec - 24 * 3600).changes;
+    const cache = db.prepare('DELETE FROM game_question_cache WHERE used_count >= 5 AND created_at < ?')
+      .run(nowSec - 30 * 86400).changes;
+    const daily = db.prepare("DELETE FROM game_daily_challenges WHERE date < ?")
+      .run(new Date((nowSec - 30 * 86400) * 1000).toISOString().slice(0, 10)).changes;
+    return { issues, cache: cache + daily };
+  } catch (e) {
+    console.warn('[game] 过期数据清理失败:', e instanceof Error ? e.message : String(e));
+    return { issues: 0, cache: 0 };
+  }
+}
 
-  // 先尝试 LLM 生成（带超时）
+/* ══════════════════════════════════════════════════════════════
+ * 题目缓存：LLM 生成过的题落库，重启 / 多进程复用
+ * ══════════════════════════════════════════════════════════════ */
+
+function fingerprint(stem: string): string {
+  return createHash('sha1').update(stem.trim()).digest('hex').slice(0, 32);
+}
+
+interface CacheRow {
+  stem: string;
+  options: string;
+  correct_key: string;
+  explain: string | null;
+  kg_node_id: number | null;
+  fingerprint: string;
+}
+
+function saveToCache(subject: GameSubject, grade: string | undefined, q: GameQuestion): void {
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO game_question_cache
+        (fingerprint, subject, grade, stem, options, correct_key, explain, kg_node_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      fingerprint(q.stem), subject, grade ?? null, q.stem,
+      JSON.stringify(q.options), q.correctKey, q.explain ?? null, q.kgNodeId ?? null,
+    );
+  } catch (e) {
+    console.warn('[game] 题目入库失败:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+function loadFromCache(subject: GameSubject, grade: string | undefined, limit: number): GameQuestion[] {
+  try {
+    const sql = grade
+      ? `SELECT stem, options, correct_key, explain, kg_node_id, fingerprint FROM game_question_cache
+         WHERE subject=? AND grade=? ORDER BY used_count ASC, RANDOM() LIMIT ?`
+      : `SELECT stem, options, correct_key, explain, kg_node_id, fingerprint FROM game_question_cache
+         WHERE subject=? AND grade IS NULL ORDER BY used_count ASC, RANDOM() LIMIT ?`;
+    const rows = (grade ? db.prepare(sql).all(subject, grade, limit) : db.prepare(sql).all(subject, limit)) as CacheRow[];
+    if (rows.length === 0) return [];
+
+    const bump = db.prepare('UPDATE game_question_cache SET used_count = used_count + 1 WHERE fingerprint=?');
+    return rows.flatMap((r) => {
+      const options = parseOptions(r.options);
+      if (options.length !== LANE_COUNT || !options.some((o) => o.key === r.correct_key)) return [];
+      try { bump.run(r.fingerprint); } catch { /* 忽略 */ }
+      return [{
+        id: newQuestionId(),
+        stem: r.stem,
+        options,
+        correctKey: r.correct_key,
+        explain: r.explain ?? undefined,
+        kgNodeId: r.kg_node_id ?? undefined,
+      }];
+    });
+  } catch (e) {
+    console.warn('[game] 题目缓存读取失败:', e instanceof Error ? e.message : String(e));
+    return [];
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * 课程知识图谱：为出题挑选知识点
+ * ══════════════════════════════════════════════════════════════ */
+
+interface KgCandidate {
+  id: number;
+  title: string;
+}
+
+function listKnowledgePoints(subject: GameSubject, grade?: string): KgCandidate[] {
+  try {
+    if (!grade) {
+      return db.prepare(`
+        SELECT DISTINCT n.id, n.title
+        FROM kg_nodes n
+        WHERE n.type='knowledge_point' AND n.subject=?
+        ORDER BY n.id
+      `).all(subject) as KgCandidate[];
+    }
+    return db.prepare(`
+      SELECT DISTINCT n.id, n.title
+      FROM kg_nodes n
+      JOIN curriculum_kg_map m ON m.node_id = n.id
+      JOIN curriculum_units u ON u.id = m.unit_id
+      JOIN curriculum_textbooks t ON t.id = u.textbook_id
+      WHERE n.type='knowledge_point' AND t.subject=? AND t.grade=?
+      ORDER BY n.id
+    `).all(subject, grade) as KgCandidate[];
+  } catch (e) {
+    console.warn('[game] 知识点查询失败:', e instanceof Error ? e.message : String(e));
+    return [];
+  }
+}
+
+function pickKnowledgePoint(
+  subject: GameSubject,
+  grade: string | undefined,
+  preferKgNodeIds?: number[],
+): KgCandidate | null {
+  const all = listKnowledgePoints(subject, grade);
+  if (all.length === 0) return null;
+
+  if (preferKgNodeIds && preferKgNodeIds.length > 0) {
+    const wanted = new Set(preferKgNodeIds);
+    const weak = all.filter((k) => wanted.has(k.id));
+    if (weak.length > 0) return weak[Math.floor(Math.random() * weak.length)]!;
+  }
+  return all[Math.floor(Math.random() * all.length)]!;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ * LLM 出题
+ * ══════════════════════════════════════════════════════════════ */
+
+const SUBJECT_LABEL: Record<GameSubject, string> = {
+  math: '数学',
+  chinese: '语文',
+  english: '英语',
+  science: '科学',
+};
+
+/** LLM 调用超时（毫秒）。题目池是后台预热，超时不阻塞玩家请求 */
+const LLM_TIMEOUT = 8000;
+
+function buildPrompt(subject: GameSubject, opts: IssueContext): { prompt: string; kp: KgCandidate | null } {
+  const label = SUBJECT_LABEL[subject];
+  const gl = gradeLabel(opts.grade);
+  const kp = pickKnowledgePoint(subject, opts.grade, opts.preferKgNodeIds);
+
+  const lines: string[] = [
+    `你是一名${label}老师，请出一道${label}单选题，用于课堂游戏抢答。`,
+    `1. 面向学段：${gl ?? '中小学生'}；难度与用词必须匹配该学段，不要超纲。`,
+  ];
+  if (kp) {
+    lines.push(`2. 考查知识点：「${kp.title}」——题目必须真正考查该知识点。`);
+  } else {
+    lines.push('2. 考查该学段的核心知识点。');
+  }
+  lines.push(
+    `3. 恰好 ${LANE_COUNT} 个选项（A/B/C/D），只有一个正确；干扰项要合理，不要出现“以上都对/都不对”这类取巧选项。`,
+    '4. 输出 JSON，字段：stem（题干，≤60字）、options（长度 4，每项 {key,text}）、correctKey（"A"~"D"）、explain（≤50字的一句话解析）。',
+    '只输出 JSON，不要任何其他文字。',
+  );
+
+  return { prompt: lines.join('\n'), kp };
+}
+
+/** 按学科 + 年级出题；任何失败都降级为题库题目 */
+export async function generateGameQuestion(
+  model: BaseChatModel,
+  subject: GameSubject,
+  opts: IssueContext = {},
+): Promise<GameQuestion> {
+  const { prompt, kp } = buildPrompt(subject, opts);
+
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
-    const prompt = `你是一名${sub.label}老师。请出一道${sub.label}选择题，要求：
-1. 题目难度适中，适合中小学生
-2. 有 4 个选项（A/B/C/D）
-3. 只有一个正确答案
-4. 用 JSON 格式输出，结构如下：
-{
-  "stem": "题目题干",
-  "options": [
-    { "key": "A", "text": "选项内容" },
-    { "key": "B", "text": "选项内容" },
-    { "key": "C", "text": "选项内容" },
-    { "key": "D", "text": "选项内容" }
-  ],
-  "correctKey": "A"
-}
-只输出 JSON，不要其他内容。`;
-
     const invokePromise = model.invoke([
-      new SystemMessage('你是一名有经验的学科教师，擅长出题。只输出 JSON。'),
+      new SystemMessage('你是一名有经验的学科教师，擅长按学段出题。只输出 JSON。'),
       new HumanMessage(prompt),
     ]);
 
-    // 超时竞速（超时后清理 timer 防止泄漏）
     const result: Awaited<typeof invokePromise> = await Promise.race([
       invokePromise,
       new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => reject(new Error('LLM_TIMEOUT')), LLM_TIMEOUT);
       }),
     ]);
-    clearTimeout(timeoutId);
 
     const text = typeof result.content === 'string'
       ? result.content.trim()
       : Array.isArray(result.content)
-        ? result.content.map(b => (typeof b === 'string' ? b : (b as { text?: string }).text ?? '')).join('').trim()
+        ? result.content.map((b) => (typeof b === 'string' ? b : ((b as { text?: string }).text ?? ''))).join('').trim()
         : '';
 
-    const question = parseLLMQuestion(text);
-    if (question) return question;
-
+    const parsed = parseLLMQuestion(text);
+    if (parsed) {
+      const { options, correctKey } = shuffleByIndex(parsed.options, parsed.correctIndex);
+      return {
+        id: newQuestionId(),
+        stem: parsed.stem,
+        options,
+        correctKey,
+        explain: parsed.explain,
+        kgNodeId: kp?.id,
+        kgTitle: kp?.title,
+      };
+    }
   } catch (err) {
-    // 无论成功还是超时，都要清理 timer
-    if (timeoutId) clearTimeout(timeoutId);
     const reason = err instanceof Error && err.message === 'LLM_TIMEOUT'
       ? '超时'
       : err instanceof Error ? err.message.slice(0, 100) : String(err);
     console.warn(`[game] LLM 出题失败(${reason})，降级内置题库`);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
 
-  return getFallbackQuestion(subject);
+  return getFallbackQuestion(subject, opts.grade);
 }
 
-function shuffleArray<T>(arr: T[]): T[] {
-  const a = [...arr];
-  // 使用 crypto.getRandomValues 替代 Math.random()，提供更好的均匀性
-  const buf = new Uint32Array(a.length);
-  crypto.getRandomValues(buf);
-  // Fisher-Yates 洗牌（从后向前，每次从前缀中随机选取元素交换）
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = buf[i] % (i + 1);
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+/* ══════════════════════════════════════════════════════════════
+ * 题目池：按 (学科, 年级) 分池，缓存 → 题库 → LLM 三级供给
+ * ══════════════════════════════════════════════════════════════ */
+
+const POOL_MIN = 6;
+const POOL_MAX = 20;
+/** 单次补充最多生成的题数 */
+const REFILL_BATCH = 6;
+
+interface PoolEntry {
+  items: GameQuestion[];
+  subject: GameSubject;
+  grade?: string;
 }
 
-/* ── 内置按科目题库 ── */
-const FALLBACK: Record<string, GameQuestion[]> = {
-  math: [
-    { id: 'm1', stem: '圆的周长公式是？', options: [{ key: 'A', text: 'C = 2πr' }, { key: 'B', text: 'C = πr' }, { key: 'C', text: 'C = πr²' }, { key: 'D', text: 'C = 2πr²' }], correctKey: 'A' },
-    { id: 'm2', stem: '12 × 15 = ?', options: [{ key: 'A', text: '150' }, { key: 'B', text: '170' }, { key: 'C', text: '180' }, { key: 'D', text: '190' }], correctKey: 'C' },
-    { id: 'm3', stem: '一个三角形有几个内角？', options: [{ key: 'A', text: '2 个' }, { key: 'B', text: '3 个' }, { key: 'C', text: '4 个' }, { key: 'D', text: '6 个' }], correctKey: 'B' },
-    { id: 'm4', stem: '直角三角形的两个锐角之和是多少度？', options: [{ key: 'A', text: '45°' }, { key: 'B', text: '90°' }, { key: 'C', text: '180°' }, { key: 'D', text: '360°' }], correctKey: 'B' },
-    { id: 'm5', stem: '25 的平方根是？', options: [{ key: 'A', text: '4' }, { key: 'B', text: '5' }, { key: 'C', text: '6' }, { key: 'D', text: '12.5' }], correctKey: 'B' },
-  ],
-  chinese: [
-    { id: 'c1', stem: '"春风又绿江南岸"的作者是？', options: [{ key: 'A', text: '李白' }, { key: 'B', text: '杜甫' }, { key: 'C', text: '王安石' }, { key: 'D', text: '苏轼' }], correctKey: 'C' },
-    { id: 'c2', stem: '"但愿人长久"的下一句是？', options: [{ key: 'A', text: '千里共婵娟' }, { key: 'B', text: '低头思故乡' }, { key: 'C', text: '西出阳关无故人' }, { key: 'D', text: '每逢佳节倍思亲' }], correctKey: 'A' },
-    { id: 'c3', stem: '下列哪个是象形字？', options: [{ key: 'A', text: '休' }, { key: 'B', text: '日' }, { key: 'C', text: '明' }, { key: 'D', text: '信' }], correctKey: 'B' },
-    { id: 'c4', stem: '"不亦说乎"中的"说"是什么意思？', options: [{ key: 'A', text: '说话' }, { key: 'B', text: '同"悦"，愉快' }, { key: 'C', text: '解释' }, { key: 'D', text: '劝说' }], correctKey: 'B' },
-    { id: 'c5', stem: '"窗含西岭千秋雪"出自哪首诗？', options: [{ key: 'A', text: '登鹳雀楼' }, { key: 'B', text: '绝句' }, { key: 'C', text: '望庐山瀑布' }, { key: 'D', text: '咏柳' }], correctKey: 'B' },
-  ],
-  english: [
-    { id: 'e1', stem: 'What is the past tense of "go"?', options: [{ key: 'A', text: 'goed' }, { key: 'B', text: 'went' }, { key: 'C', text: 'gone' }, { key: 'D', text: 'going' }], correctKey: 'B' },
-    { id: 'e2', stem: '"Beautiful" means?', options: [{ key: 'A', text: '丑陋的' }, { key: 'B', text: '漂亮的' }, { key: 'C', text: '有趣的' }, { key: 'D', text: '聪明的' }], correctKey: 'B' },
-    { id: 'e3', stem: 'Which is a fruit?', options: [{ key: 'A', text: 'carrot' }, { key: 'B', text: 'apple' }, { key: 'C', text: 'broccoli' }, { key: 'D', text: 'potato' }], correctKey: 'B' },
-    { id: 'e4', stem: '"I ___ a student." Choose the correct word.', options: [{ key: 'A', text: 'is' }, { key: 'B', text: 'am' }, { key: 'C', text: 'are' }, { key: 'D', text: 'be' }], correctKey: 'B' },
-    { id: 'e5', stem: 'What color is the sky?', options: [{ key: 'A', text: 'Green' }, { key: 'B', text: 'Blue' }, { key: 'C', text: 'Red' }, { key: 'D', text: 'Yellow' }], correctKey: 'B' },
-  ],
-  science: [
-    { id: 's1', stem: '光在真空中的传播速度约为？', options: [{ key: 'A', text: '3×10⁶ m/s' }, { key: 'B', text: '3×10⁸ m/s' }, { key: 'C', text: '3×10¹⁰ m/s' }, { key: 'D', text: '3×10⁴ m/s' }], correctKey: 'B' },
-    { id: 's2', stem: '地球的自转周期大约是？', options: [{ key: 'A', text: '12 小时' }, { key: 'B', text: '24 小时' }, { key: 'C', text: '365 天' }, { key: 'D', text: '30 天' }], correctKey: 'B' },
-    { id: 's3', stem: '下列哪个是哺乳动物？', options: [{ key: 'A', text: '鲤鱼' }, { key: 'B', text: '鲸鱼' }, { key: 'C', text: '鳄鱼' }, { key: 'D', text: '章鱼' }], correctKey: 'B' },
-    { id: 's4', stem: '水的化学式是？', options: [{ key: 'A', text: 'CO₂' }, { key: 'B', text: 'H₂O' }, { key: 'C', text: 'NaCl' }, { key: 'D', text: 'O₂' }], correctKey: 'B' },
-    { id: 's5', stem: '植物进行光合作用需要什么？', options: [{ key: 'A', text: '月光和水分' }, { key: 'B', text: '阳光、水和二氧化碳' }, { key: 'C', text: '土壤和肥料' }, { key: 'D', text: '氧气和糖分' }], correctKey: 'B' },
-  ],
-};
+const pools = new Map<string, PoolEntry>();
+const refilling = new Set<string>();
+let poolModel: BaseChatModel | null = null;
 
-const FALLBACK_INDICES: Record<string, number> = {};
-
-/** 打乱选项并重新定位正确选项的 key */
-function shuffleOptionsAndLocateCorrect(
-  options: { key: string; text: string }[],
-  correctKey: string,
-): { shuffled: { key: string; text: string }[]; newCorrectKey: string } {
-  const correctOption = options.find(o => o.key === correctKey);
-  if (!correctOption) return { shuffled: options, newCorrectKey: options[0]?.key ?? 'A' };
-  const shuffled = shuffleArray(options);
-  const newCorrectKey = shuffled.find(o => o.text === correctOption.text)?.key ?? shuffled[0]?.key ?? 'A';
-  return { shuffled, newCorrectKey };
+function poolKey(subject: GameSubject, grade?: string): string {
+  return `${subject}|${grade ?? '-'}`;
 }
 
-function getFallbackQuestion(subject: string): GameQuestion {
-  const bank = FALLBACK[subject] || FALLBACK.math;
-  if (!FALLBACK[subject]) console.warn(`[game] 未知学科 "${subject}"，降级使用数学兜底题库`);
-  FALLBACK_INDICES[subject] ??= 0;
-  const idx = FALLBACK_INDICES[subject]++ % bank.length;
-  const q = { ...bank[idx] };
-  const { shuffled, newCorrectKey } = shuffleOptionsAndLocateCorrect(q.options, q.correctKey);
-  return { ...q, id: `q_${Date.now()}_${randomUUID().slice(0, 6)}`, options: shuffled, correctKey: newCorrectKey };
-}
-
-/* ── 题目池 ── */
-
-/** 初始化题目池：用兜底题库预填充，后续请求秒出 */
-export function initQuestionPool(model: BaseChatModel) {
-  poolModel = model;
-  for (const subject of Object.keys(SUBJECT_MAP)) {
-    questionPools.set(subject, []);
-    fillPoolWithFallback(subject);
-  }
-  console.log('[game] 题目池已初始化（全部学科）');
-}
-
-function fillPoolWithFallback(subject: string) {
-  const pool = questionPools.get(subject)!;
-  while (pool.length < POOL_MAX) {
-    pool.push(getFallbackQuestion(subject));
-  }
-}
-
-/** 后台用 LLM 补充题目池（不阻塞主请求） */
-async function refillPool(subject: string) {
-  if (!poolModel || poolRefilling.get(subject)) return;
-  poolRefilling.set(subject, true);
-  const pool = questionPools.get(subject)!;
+/** 加载 curriculum/game-bank/*.json 预生成题库（存在则注册，不存在则跳过） */
+function loadOfflineBanks(): void {
   try {
-    let added = 0;
-    while (pool.length < POOL_MAX && added < 5) {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const dir = join(here, '..', 'curriculum', 'game-bank');
+    if (!existsSync(dir)) return;
+    let files = 0;
+    let total = 0;
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue;
       try {
-        const q = await generateGameQuestion(poolModel, subject);
-        pool.push(q);
-        added++;
-      } catch {
-        pool.push(getFallbackQuestion(subject));
-        added++;
+        const raw = JSON.parse(readFileSync(join(dir, name), 'utf8')) as {
+          subject?: string; grade?: string; items?: unknown[];
+        };
+        const subject = normalizeSubject(raw.subject);
+        if (!subject || !Array.isArray(raw.items)) {
+          console.warn(`[game] 离线题库 ${name} 结构不合法，已跳过`);
+          continue;
+        }
+        const merged = registerExtraBank(subject, raw.grade, raw.items);
+        if (merged > 0) { files++; total += merged; }
+      } catch (e) {
+        console.warn(`[game] 离线题库 ${name} 解析失败:`, e instanceof Error ? e.message : String(e));
       }
     }
+    if (files > 0) console.log(`[game] 已加载离线题库：${files} 个文件 / ${total} 道题`);
+  } catch (e) {
+    console.warn('[game] 离线题库加载失败:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** 注入出题模型（服务启动时调用一次） */
+export function initQuestionPool(model: BaseChatModel): void {
+  poolModel = model;
+  loadOfflineBanks();
+  console.log('[game] 出题引擎就绪（按 学科 × 年级 懒加载分池）');
+}
+
+function ensurePool(subject: GameSubject, grade?: string, preferKgNodeIds?: number[]): PoolEntry {
+  const key = poolKey(subject, grade);
+  let entry = pools.get(key);
+  if (!entry) {
+    // 先吃缓存（历史 LLM 生成的好题），再补题库，最后后台用 LLM 预热
+    const cached = loadFromCache(subject, grade, POOL_MIN);
+    entry = { items: cached, subject, grade };
+    pools.set(key, entry);
+    fillWithFallback(entry);
+    if (poolModel) {
+      void refillPool(entry, preferKgNodeIds).catch((e) =>
+        console.warn('[game] pool warmup:', e instanceof Error ? e.message : String(e)));
+    }
+  }
+  return entry;
+}
+
+/** 用题库补到下限（同步、零延迟） */
+function fillWithFallback(entry: PoolEntry): void {
+  while (entry.items.length < POOL_MIN) {
+    entry.items.push(getFallbackQuestion(entry.subject, entry.grade));
+  }
+}
+
+/** 后台用 LLM 补充题目池（不阻塞主请求），生成成功的题落缓存 */
+async function refillPool(entry: PoolEntry, preferKgNodeIds?: number[]): Promise<void> {
+  const key = poolKey(entry.subject, entry.grade);
+  if (!poolModel || refilling.has(key)) return;
+  refilling.add(key);
+  try {
+    let added = 0;
+    while (entry.items.length < POOL_MAX && added < REFILL_BATCH) {
+      let q: GameQuestion;
+      try {
+        q = await generateGameQuestion(poolModel, entry.subject, {
+          grade: entry.grade,
+          preferKgNodeIds,
+        });
+      } catch {
+        q = getFallbackQuestion(entry.subject, entry.grade);
+      }
+      // 只有真正由 LLM 生成的题才值得缓存（题库题无需重复存）
+      if (q.kgNodeId !== undefined) saveToCache(entry.subject, entry.grade, q);
+      entry.items.push(q);
+      added++;
+    }
   } finally {
-    poolRefilling.set(subject, false);
+    refilling.delete(key);
   }
 }
 
-/** 从题目池获取一道题（秒出） */
-export function getPooledQuestion(subject: string): GameQuestion {
-  let pool = questionPools.get(subject);
-  if (!pool) {
-    pool = [];
-    questionPools.set(subject, pool);
+/**
+ * 从题目池取一道题（同步、秒出），并写入出题账本。
+ * 池子低于下限时后台补充。
+ */
+export function getPooledQuestion(subject: GameSubject, ctx: IssueContext = {}): GameQuestion {
+  const entry = ensurePool(subject, ctx.grade, ctx.preferKgNodeIds);
+  if (entry.items.length < POOL_MIN && poolModel) {
+    void refillPool(entry, ctx.preferKgNodeIds).catch((e) =>
+      console.warn('[game] pool refill:', e instanceof Error ? e.message : String(e)));
   }
-  if (pool.length === 0) {
-    pool.push(getFallbackQuestion(subject));
-  }
-  // 后台异步补充（不阻塞）
-  if (pool.length < POOL_MIN && poolModel) {
-    refillPool(subject).catch(e => console.warn('[game] pool refill:', e instanceof Error ? e.message : String(e)));
-  }
-  return pool.shift() ?? getFallbackQuestion(subject);
+  const q = entry.items.shift() ?? getFallbackQuestion(subject, ctx.grade);
+  recordIssue(q, subject, ctx);
+  return q;
 }
 
-/** 从题目池批量获取题目 */
-export function getPooledQuestions(subject: string, count: number): GameQuestion[] {
-  return Array.from({ length: count }, () => getPooledQuestion(subject));
+/**
+ * 批量取题（count 已由调用方 clamp）。
+ * 同一批内按题干去重：随机抽 5 题也可能撞车，去重后一次请求就是 5 道不同的题，
+ * 减少前端反复补拉。
+ */
+export function getPooledQuestions(subject: GameSubject, count: number, ctx: IssueContext = {}): GameQuestion[] {
+  const out: GameQuestion[] = [];
+  const seen = new Set<string>();
+  let guard = 0;
+  while (out.length < count && guard < count * 8) {
+    guard++;
+    const q = getPooledQuestion(subject, ctx);
+    if (seen.has(q.stem)) continue;
+    seen.add(q.stem);
+    out.push(q);
+  }
+  // 题库比 count 还小时允许重复补齐，避免返回空数组
+  while (out.length < count) out.push(getPooledQuestion(subject, ctx));
+  return out;
 }

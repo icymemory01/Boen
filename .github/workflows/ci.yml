@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  verify:
+    name: Test & Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # better-sqlite3 是原生模块，runner 上会按当前 Node 版本正常编译预构建包
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Typecheck server
+        run: node node_modules/typescript/bin/tsc --noEmit -p apps/server/tsconfig.json
+
+      - name: Typecheck web
+        run: node node_modules/vue-tsc/bin/vue-tsc.js --noEmit -p apps/web/tsconfig.json

@@ -73,6 +73,17 @@ plan_steps → advance_step → exit_session
 - 课程大纲可视化（按教材单元/章节/知识点）
 - 掌握度星级展示
 
+### 知识跑酷（教育游戏）
+- Phaser 4 四跑道跑酷：4 个选项就是 4 扇门，撞对加分、撞错扣命（共 3 条）
+- 三种玩法：**无尽跑酷** / **每日挑战**（当天固定 10 题）/ **关卡**（每关 5 题，答对 4 题过）
+- 题目按 **学科 × 年级** 分池，并优先考查该学生的**薄弱知识点**（题目携带知识图谱节点）
+- 每次作答立即反馈：答错时高亮正确答案 + ✓/✗ 标记 + 一句话解析
+- **成绩不可伪造**：出题时服务端把正确答案写进出题账本（保留 24h），结算时按 `questionId` 逐题核验，
+  客户端上报的分数一律不采信
+- 局末结算：成绩入库 → 知识点熟练度（Elo）回写 → **答错的题自动进错题本** → 按每日上限发星月积分
+- 排行榜（北京时间自然周，匿名昵称）、个人最佳、总正确率、各科关卡进度
+- 题干可朗读（TTS），对错有合成音效，移动端左右半屏操作
+
 ---
 
 ## 技术栈
@@ -88,6 +99,7 @@ plan_steps → advance_step → exit_session
 | 全文搜索 | SQLite FTS5（BM25） |
 | 知识库 | SQLite（`better-sqlite3`）+ 自定义课程知识图谱；语数英 G1-G9、科学 G1-G9 |
 | 公式编辑 | MathLive（所见即所得） |
+| 教育游戏 | Phaser 4（Canvas 跑酷）+ WebAudio 现场合成音效 + 浏览器 TTS 朗读题干 |
 | 包管理 | npm workspaces（monorepo） |
 
 ## 目录结构
@@ -100,7 +112,8 @@ boen/
 ├── apps/
 │   ├── server/          # Hono SSE 后端（聊天/考试/画像/探索/记忆 API）
 │   └── web/             # Vue 3 前端
-└── script/              # 数据分析、课程数据导入脚本
+├── scripts/             # 数据分析、课程导入、离线题库生成（build-game-bank.mjs）
+└── docs/                # 合规记录与静态演示页
 ```
 
 ## LangGraph 图结构
@@ -136,17 +149,54 @@ agent → __end__(无 tool_calls)
 
 ## 配置
 
-复制 `.env.example` 为 `.env` 并填写：
+复制 `.env.example` 为 `.env` 并填写。当前唯一必填的是模型密钥：
 
 ```env
-BOEN_PROVIDER=openic          # openai（兼容）| anthropic
-BOEN_MODEL=deepseek-v4-flash
-BOEN_BASE_URL=https://api.deepseek.com
-BOEN_API_KEY=你的key
+# 必填：DeepSeek（免费 Flash 档 / 会员 Pro 档由服务端按订阅切换）
+DEEPSEEK_API_KEY=你的key
 PORT=8787
+
+# 登录（Frost ID OAuth）—— 缺 FROST_ID_CLIENT_SECRET 时服务端拒绝启动
+VITE_FROST_ID_URL=https://frostrain.tech
+VITE_FROST_ID_CLIENT_ID=boen-client
+FROST_ID_INTERNAL_URL=http://127.0.0.1:4000
+FROST_ID_CLIENT_ID=boen-client
+FROST_ID_CLIENT_SECRET=你的secret
+
+# 会员支付（Waffo）—— 生产 KYB 通过前保持 WAFFO_ALLOW_TEST_CHECKOUT=false
+WAFFO_ENVIRONMENT=test
+WAFFO_ALLOW_TEST_CHECKOUT=false
+WAFFO_MERCHANT_ID=
+WAFFO_PRIVATE_KEY=
+WAFFO_STORE_ID=
+WAFFO_PRODUCT_MONTHLY=
+WAFFO_PRODUCT_YEARLY=
+WAFFO_WEB_ORIGIN=https://boen.frostrain.tech
+WAFFO_PORTAL_URL=https://pancake.waffo.ai/consumer/portal/login
+
+# 错题本 OCR（二选一或都配）：阿里云结构化识别 / 百炼多模态 VLM
+ALIYUN_ACCESS_KEY_ID=
+ALIYUN_ACCESS_KEY_SECRET=
+ALIYUN_OCR_ENDPOINT=ocr-api.cn-hangzhou.aliyuncs.com
+BAILIAN_API_KEY=
+BAILIAN_BASE_URL=
+BAILIAN_VL_MODEL=qwen3-vl-plus
 ```
 
-换模型只需改 `.env`：换 OpenAI 兼容厂商改 `BASE_URL/MODEL/KEY`；用 Claude 把 `PROVIDER` 设为 `anthropic`。
+模型全部走 DeepSeek（讯飞 provider 已下线），**不再有 `BOEN_PROVIDER` / `BOEN_MODEL` 这类开关**；
+免费档与会员 Pro 档由订阅状态决定。完整字段与注释以 `.env.example` 为准。
+
+### 离线题库（可选）
+
+知识跑酷的题目默认由「LLM 实时生成 + 内置题库」供给。想让题库更厚、更贴合教材，
+可以用脚本按 curriculum 教材离线批量生成，服务端启动时会自动加载：
+
+```bash
+node scripts/build-game-bank.mjs --dry-run          # 先看有多少知识点可出题
+DEEPSEEK_API_KEY=... node scripts/build-game-bank.mjs --subject=math --grade=3 --limit=40
+```
+
+产物落在 `apps/server/curriculum/game-bank/<subject>-g<grade>.json`，重复执行会合并去重。
 
 ## 运行
 
@@ -174,6 +224,13 @@ npm run dev:web                # 启动前端 → http://localhost:5173
 | `/api/profile/outline` | GET | 课程大纲 |
 | `/api/render-tikz` | POST | TikZ → SVG 渲染 |
 | `/api/model/status` | GET | 当前模型状态 |
+| `/api/game/question` | GET | 单题出题（学科 + 年级 + 薄弱点） |
+| `/api/game/questions` | GET | 批量出题（跑酷一次拉 5 道） |
+| `/api/game/daily` | GET | 每日挑战：当天固定题集（刷新不换题） |
+| `/api/game/stage` | GET | 关卡进度 + 本关题目（5 题，答对 4 题过关） |
+| `/api/game/finish` | POST | 局末结算：**服务端按出题账本核验**，再入库/回写画像/发积分 |
+| `/api/game/leaderboard` | GET | 排行榜（北京时间自然周 / 全部，匿名昵称） |
+| `/api/game/stats` | GET | 个人战绩 + 最近 10 局 + 各科关卡进度 |
 
 详细接口定义见 `packages/shared/src/index.ts` 中的 `SseEvent` 类型。
 

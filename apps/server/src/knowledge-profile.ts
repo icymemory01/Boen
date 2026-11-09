@@ -75,6 +75,8 @@ export const MODE_ELO_MULTIPLIERS: Record<string, number> = {
   exam: 2.0,
   /** 探索课：超低权重，鼓励而非评估 */
   explore: 0.4,
+  /** 知识跑酷小游戏：轻量练习，高于 QA 低于复习 */
+  game: 1.2,
 };
 
 /** 前置依赖反向传播用的 K-factor（比主更新弱得多） */

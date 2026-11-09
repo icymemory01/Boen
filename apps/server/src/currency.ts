@@ -151,7 +151,7 @@ export interface EarnResult {
 export function earnPoints(
   userId: string,
   amount: number,
-  reason: 'session' | 'exam',
+  reason: 'session' | 'exam' | 'game',
   refId?: string,
 ): EarnResult {
   if (amount <= 0) {

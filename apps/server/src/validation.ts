@@ -85,9 +85,45 @@ export const RedeemCodeSchema = z.object({
   code: z.string().min(1),
 }).strict();
 
+/** 游戏支持的年级（与 shared 的 Grade 对齐） */
+const GAME_GRADES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'high', 'college'] as const;
+const GAME_SUBJECTS = ['math', 'chinese', 'english', 'science'] as const;
+
 /** GET /api/game/question */
 export const GameQuestionSchema = z.object({
-  subject: z.enum(['math', 'chinese', 'english', 'science']).default('math'),
+  subject: z.enum(GAME_SUBJECTS).default('math'),
+  grade: z.enum(GAME_GRADES).optional(),
+});
+
+/** GET /api/game/questions —— 批量出题 */
+export const GameBatchQuerySchema = z.object({
+  subject: z.enum(GAME_SUBJECTS).default('math'),
+  grade: z.enum(GAME_GRADES).optional(),
+  count: z.coerce.number().int().min(1).max(10).default(5),
+});
+
+/** POST /api/game/finish —— 局末结算上报
+ *
+ * 只上报「哪些题、撞了哪个选项」。分数 / 对错 / 连击一律由服务端按出题账本重算，
+ * 客户端报了也不采信。
+ */
+export const GameFinishSchema = z.object({
+  subject: z.enum(GAME_SUBJECTS),
+  grade: z.enum(GAME_GRADES).optional(),
+  mode: z.enum(['endless', 'daily', 'stage']).default('endless'),
+  /** 关卡模式下上报当前关卡号 */
+  stage: z.number().int().min(1).max(999).optional(),
+  durationMs: z.number().int().min(0).max(6 * 60 * 60 * 1000).optional(),
+  answers: z.array(z.object({
+    questionId: z.string().min(1).max(80),
+    chosenKey: z.enum(['A', 'B', 'C', 'D']).optional(),
+  })).max(200),
+}).strict();
+
+/** GET /api/game/leaderboard */
+export const GameLeaderboardQuerySchema = z.object({
+  subject: z.enum(GAME_SUBJECTS).optional(),
+  period: z.enum(['week', 'all']).default('week'),
 });
 
 /** REDEEM 积分兑换 */
