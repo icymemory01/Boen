@@ -84,6 +84,13 @@ import { createMembershipCheckout, handleWaffoWebhook, isWaffoEnabled, listPurch
 import { initQuestionPool, getPooledQuestion, getPooledQuestions, purgeOldGameData } from './game.js';
 import { finishGameSession, getGameStats, getLeaderboard, getRecentSessions, getDailyChallenge, getStageProgress, getAllStageProgress } from './game-store.js';
 import { GAME_DAILY_SIZE, GAME_STAGE_SIZE } from '@boen/shared';
+import { recordUsage, summarizeUsage, usageScope, type UsageFeature } from './usage.js';
+import { checkInput, sanitizeOutput } from './safety.js';
+import { TokenRedactor } from './stream-redact.js';
+import { createRateLimitStore } from './state-store.js';
+import { createQueue, queueStats, QueueFullError } from './queue.js';
+import { hasGuardianConsent, recordGuardianConsent, revokeGuardianConsent, getGuardianConsent, requiresConsentFor, GUARDIAN_CONSENT_VERSION } from './consent.js';
+import { log } from './logger.js';
 
 // 从仓库根加载 .env
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -103,12 +110,45 @@ const DEEPSEEK_MODELS: Record<string, string> = {
 /** 出卷专用：开启 thinking，放大输出上限与超时（思考耗时长，质量优先）。 */
 const EXAM_MODEL_OPTS = { thinking: true, maxTokens: 8192, timeout: 300000 } as const;
 
+/** LLM 调用的起始时间（按 runId），用于算时延 */
+const llmStartedAt = new Map<string, number>();
+
+/**
+ * 用量回调：挂在模型上，任何经过 createModel 的调用都会自动记一条 usage_events。
+ * 覆盖聊天、出卷、批改、游戏出题等全部路径，避免各调用点自己漏记。
+ */
+function usageCallbacks(feature: UsageFeature, modelName: string) {
+  return {
+    handleLLMStart: (_llm: unknown, _prompts: unknown, runId: string) => {
+      llmStartedAt.set(runId, Date.now());
+    },
+    handleLLMEnd: (output: unknown, runId: string) => {
+      const started = llmStartedAt.get(runId) ?? 0;
+      llmStartedAt.delete(runId);
+      recordUsage({
+        feature, model: modelName, response: output,
+        latencyMs: started ? Date.now() - started : 0,
+      });
+    },
+    handleLLMError: (err: unknown, runId: string) => {
+      const started = llmStartedAt.get(runId) ?? 0;
+      llmStartedAt.delete(runId);
+      recordUsage({
+        feature, model: modelName, ok: false,
+        latencyMs: started ? Date.now() - started : 0,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    },
+  };
+}
+
 function createModel(
   provider: string,
   opts?: { thinking?: boolean; maxTokens?: number; timeout?: number },
+  feature: UsageFeature = 'chat',
 ): BaseChatModel {
   const modelName = DEEPSEEK_MODELS[provider] ?? 'deepseek-v4-flash';
-  return getChatModel({
+  const base = getChatModel({
     provider: 'deepseek',
     model: modelName,
     apiKey: DEEPSEEK_API_KEY,
@@ -116,13 +156,19 @@ function createModel(
     maxTokens: opts?.maxTokens,
     timeout: opts?.timeout,
   });
+  try {
+    // withConfig 返回 Runnable，这里回退成 ChatModel 使用（只用于 invoke/stream）
+    return base.withConfig({ callbacks: [usageCallbacks(feature, modelName)] as never }) as unknown as BaseChatModel;
+  } catch {
+    return base;
+  }
 }
 const providerScope = new AsyncLocalStorage<string>();
-const model = scopedResource(providerScope, (provider) => createModel(provider));
+const model = scopedResource(providerScope, (provider) => createModel(provider, undefined, 'chat'));
 // 出卷沿用用户所选档位，但开启 thinking（延迟被异步进度条吸收）
-const examModel = scopedResource(providerScope, (provider) => createModel(provider, EXAM_MODEL_OPTS));
+const examModel = scopedResource(providerScope, (provider) => createModel(provider, EXAM_MODEL_OPTS, 'exam_generate'));
 // 游戏题目池：全局共享一份（不随用户档位切换），启动时预填充，请求秒出
-initQuestionPool(createModel('default'));
+initQuestionPool(createModel('default', undefined, 'game_question'));
 
 // LangGraph 对话状态持久化到 SQLite（重启不丢失）
 const checkpointer = new SqliteSaver(db);
@@ -1317,9 +1363,11 @@ app.post('/api/exam/generate', async (c) => {
     const send = (e: SseEvent) => stream.writeSSE({ data: JSON.stringify(e) });
     const ac = new AbortController();
     stream.onAbort(() => { ac.abort(); });
+    // 用量归属：出卷是最贵的一条链路，必须能按用户归因
+    usageScope.enterWith({ userId });
     try {
       await send({ type: 'exam_generating' });
-      const exam = await generateExam(
+      const exam = await examQueue.run(() => generateExam(
         examModel,
         { subject: body.subject, grade: body.grade, durationMinutes: body.durationMinutes, notes: body.notes, totalScore: body.totalScore },
         (p) => {
@@ -1328,7 +1376,7 @@ app.post('/api/exam/generate', async (c) => {
         },
         userId,
         ac.signal,
-      );
+      ));
       // 使用预创建的 examId 更新记录，否则新建
       const session = preCreatedId
         ? updateExamSession(preCreatedId, userId, { subject: body.subject, grade: body.grade }, exam)!
@@ -1824,10 +1872,46 @@ app.post('/api/chat', async (c) => {
   const owned =
     !!body.conversationId && getConversation(body.conversationId)?.userId === userId;
   return streamSSE(c, async (stream) => {
-    const send = (e: SseEvent) => stream.writeSSE({ data: JSON.stringify(e) });
+    const rawSend = (e: SseEvent) => stream.writeSSE({ data: JSON.stringify(e) });
+    // 流式脱敏：token 先过缓冲区再下发，避免跨 chunk 的手机号 / 站外链接漏出
+    const redactor = new TokenRedactor();
+    const send = async (e: SseEvent): Promise<void> => {
+      if (e.type === 'token') {
+        for (const part of redactor.push(e.value)) {
+          await rawSend({ type: 'token', value: part });
+        }
+        return;
+      }
+      // 非 token 事件（done / error / settlement…）前先把缓冲吐干净，保证顺序
+      for (const part of redactor.flush()) {
+        await rawSend({ type: 'token', value: part });
+      }
+      await rawSend(e);
+    };
+    // 用量归属：让 LLM 回调能读到本次请求的用户
+    if (userId) usageScope.enterWith({ userId });
     const ac = new AbortController();
     stream.onAbort(() => { ac.abort(); });
     try {
+      // 内容安全闸：命中明显不当主题直接拦下，不进模型、不烧 token
+      const safety = checkInput(body.message ?? '');
+      if (!safety.allowed) {
+        log.warn('safety.blocked_input', { category: safety.category ?? 'unknown', userId });
+        await send({ type: 'token', value: safety.reply ?? '这个话题我不能聊哦。' });
+        await send({ type: 'done' });
+        return;
+      }
+
+      // 监护人同意闸：小学 1–6 年级（可能不满 14 周岁）需先完成监护人同意
+      if (userId && requiresConsentFor(body.grade) && !hasGuardianConsent(userId)) {
+        await send({
+          type: 'token',
+          value: '你的账号还需要家长同意才能使用哦。请让家长在「设置」里完成监护人同意，再回来继续学习。',
+        });
+        await send({ type: 'done' });
+        return;
+      }
+
       // 如果有归属本人的 conversationId，保存用户消息
       if (owned) {
         const userContent = body.attachments?.length
@@ -2375,49 +2459,18 @@ app.post('/api/answer', async (c) => {
 });
 
 // ── 教育游戏 ─────────────────────────────────────────
-import { GameQuestionSchema, GameBatchQuerySchema, GameFinishSchema, GameLeaderboardQuerySchema } from './validation.js';
+import { GameQuestionSchema, GameBatchQuerySchema, GameFinishSchema, GameLeaderboardQuerySchema, GuardianConsentSchema } from './validation.js';
 
-/* ── 通用限流工具 ── */
-const RATE_LIMIT_MAX_ENTRIES = 10000;
-const RATE_LIMIT_CLEANUP_MS = 5 * 60_000; // 每 5 分钟清理
+/* ── 通用限流工具（存储后端可替换，见 state-store.ts）── */
+const rateLimitStore = createRateLimitStore();
 
-function getRateLimitMap(): Map<string, number[]> {
-  if (!(globalThis as any).__rateLimitMap) {
-    (globalThis as any).__rateLimitMap = new Map<string, number[]>();
-    // 定期清理过期条目，防止内存泄漏
-    (globalThis as any).__rateLimitCleanupTimer = setInterval(() => {
-      const map: Map<string, number[]> = (globalThis as any).__rateLimitMap;
-      const cutoff = Date.now() - 60_000; // 清理超过 1 分钟未活动的条目
-      for (const [k, ts] of map) {
-        const active = ts.filter(t => t > cutoff);
-        if (active.length === 0) map.delete(k);
-        else map.set(k, active);
-      }
-    }, RATE_LIMIT_CLEANUP_MS);
-    // 防止定时器阻止进程退出
-    if ((globalThis as any).__rateLimitCleanupTimer?.unref) {
-      (globalThis as any).__rateLimitCleanupTimer.unref();
-    }
-  }
-  return (globalThis as any).__rateLimitMap;
-}
-
+/** 记一次请求；返回 false 表示应回 429 */
 function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
-  const map = getRateLimitMap();
-  // 条目数超过上限时全局清理
-  if (map.size > RATE_LIMIT_MAX_ENTRIES) {
-    const cutoff = Date.now() - windowMs;
-    for (const [k, ts] of map) {
-      if (ts.every(t => t <= cutoff)) map.delete(k);
-    }
-  }
-  const now = Date.now();
-  const timestamps = map.get(key) ?? [];
-  timestamps.push(now);
-  const recent = timestamps.filter(t => now - t < windowMs);
-  map.set(key, recent);
-  return recent.length <= maxRequests;
+  return rateLimitStore.hit(key, { max: maxRequests, windowMs });
 }
+
+/* ── 重活队列：限并发 + 限排队，避免同步等 LLM 把进程占满 ── */
+const examQueue = createQueue('exam_generate', 2, 20);
 
 /**
  * 游戏出题的「个性化上下文」：取当前用户的薄弱知识点，作为优先出题主题。
@@ -2593,6 +2646,66 @@ app.get('/api/game/stage', async (c) => {
   } catch (err) {
     console.error('[game] 关卡读取失败:', sanitizeError(err));
     return c.json({ error: '关卡读取失败' }, 500);
+  }
+});
+
+/* ── 监护人同意（不满 14 周岁，PIPL 第 31 条）─────────── */
+app.get('/api/consent/guardian', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+  return c.json({
+    version: GUARDIAN_CONSENT_VERSION,
+    agreed: hasGuardianConsent(userId),
+    consent: getGuardianConsent(userId),
+  });
+});
+
+app.post('/api/consent/guardian', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  let body: unknown;
+  try { body = await c.req.json(); } catch { body = {}; }
+  const parsed = GuardianConsentSchema.safeParse(body ?? {});
+  if (!parsed.success) return c.json({ error: 'invalid_payload' }, 400);
+
+  const forwarded = c.req.header('x-forwarded-for') || c.req.header('x-real-ip');
+  const consent = recordGuardianConsent(userId, {
+    guardianName: parsed.data.guardianName,
+    relationship: parsed.data.relationship,
+    ip: forwarded?.split(',')[0]?.trim(),
+  });
+  log.info('consent.guardian_recorded', { userId, version: GUARDIAN_CONSENT_VERSION });
+  return c.json({ ok: true, version: GUARDIAN_CONSENT_VERSION, consent });
+});
+
+app.delete('/api/consent/guardian', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+  const ok = revokeGuardianConsent(userId);
+  log.info('consent.guardian_revoked', { userId, ok });
+  return c.json({ ok });
+});
+
+/* ── 用量与成本（运维接口，需 ADMIN_TOKEN）────────────── */
+app.get('/api/admin/usage', async (c) => {
+  const expected = process.env.ADMIN_TOKEN;
+  // 未配置 ADMIN_TOKEN 视为关闭该接口，避免默认把成本数据暴露出去
+  if (!expected) return c.json({ error: 'not_found' }, 404);
+  if (c.req.header('x-admin-token') !== expected) return c.json({ error: 'forbidden' }, 403);
+
+  const days = Math.min(90, Math.max(1, Number(c.req.query('days')) || 7));
+  const since = Math.floor(Date.now() / 1000) - days * 86400;
+  try {
+    return c.json({
+      days,
+      ...summarizeUsage({ since, topUsers: 10 }),
+      queues: queueStats(),
+      rateLimit: rateLimitStore.stats(),
+    });
+  } catch (err) {
+    log.error('admin.usage_failed', {}, err);
+    return c.json({ error: 'usage_failed' }, 500);
   }
 });
 

@@ -220,8 +220,19 @@ for (const m of MIGRATIONS) {
       })();
       console.log(`[db] 迁移 v${m.version} 完成: ${m.description}`);
     } catch (e) {
-      console.warn(`[db] 迁移 v${m.version} 失败 (${m.description}):`, e instanceof Error ? e.message : e);
-      // 迁移失败不阻止启动 — 表可能已经存在需要的列
+      // 迁移失败必须阻断启动：带着残缺 schema 继续跑，会在业务层炸出更难查的错误。
+      // 只有「列已存在」这类幂等失败可以放过（addColumnIfNotExists 内部已处理）。
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/duplicate column name/i.test(msg)) {
+        console.warn(`[db] 迁移 v${m.version} 跳过（列已存在）: ${m.description}`);
+        try {
+          db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, unixepoch())').run(m.version);
+        } catch { /* ignore */ }
+        continue;
+      }
+      console.error(`[db] 迁移 v${m.version} 失败 (${m.description}): ${msg}`);
+      console.error('[db] 数据库 schema 与应用版本不一致，拒绝启动。请先修复迁移或回滚到匹配版本。');
+      process.exit(1);
     }
   }
 }
@@ -652,6 +663,58 @@ db.exec(`
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (user_id, subject)
   );
+`);
+
+// ── 用量与成本：每次 LLM 调用的记账 ──────────────
+// 按 token 计费的生意必须能回答「这个功能/这个用户花了多少钱」，
+// 所以把 prompt/completion token 落库，报表由 scripts/usage-report.mjs 汇总。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    feature TEXT NOT NULL,
+    model TEXT,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 1,
+    error TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_usage_feature ON usage_events(feature, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_events(user_id, created_at DESC);
+`);
+
+// ── 监护人同意（14 周岁以下）──────────────────
+// PIPL 第 31 条：处理不满十四周岁未成年人个人信息，应取得监护人同意。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS guardian_consents (
+    user_id TEXT PRIMARY KEY,
+    guardian_name TEXT NOT NULL DEFAULT '',
+    relationship TEXT NOT NULL DEFAULT '',
+    consent_version TEXT NOT NULL,
+    agreed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    ip TEXT,
+    revoked_at INTEGER
+  );
+`);
+
+// ── 画像校准样本（逐次口径）──────────────────
+// 每次作答前记下「当时的预测概率」，作答后记下实际结果。
+// 有了逐次样本，Brier / 可靠性曲线才是上线级证据（聚合口径只是过渡）。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS calibration_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    kg_node_id INTEGER NOT NULL,
+    predicted REAL NOT NULL,
+    actual INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'game',
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+  CREATE INDEX IF NOT EXISTS idx_calib_user ON calibration_samples(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_calib_created ON calibration_samples(created_at DESC);
 `);
 
 initMembership(db);

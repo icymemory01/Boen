@@ -2,7 +2,7 @@
   "name": "boen",
   "private": true,
   "version": "0.5.0",
-  "description": "鍗氭枃 Boen 鈥?瀛︿範杈呭姪鏅鸿兘浣擄紙LangGraph.js 鍏?TS 鏍堬級",
+  "description": "博文 Boen — 学习辅助智能体（LangGraph.js 全 TS 栈）",
   "type": "module",
   "workspaces": [
     "packages/*",

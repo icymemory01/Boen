@@ -18,6 +18,7 @@ import {
 import db from './db.js';
 import { earnPoints } from './currency.js';
 import { updateProficiency } from './knowledge-profile.js';
+import { recordCalibrationSample } from './calibration-store.js';
 import { verifySubmittedAnswers, type GameQuestion, type SubmittedAnswer } from './game.js';
 import { computeGamePoints } from './game-core.js';
 import { beijingDateStr, startOfBeijingDay, startOfBeijingWeek } from './game-time.js';
@@ -194,6 +195,16 @@ export function finishGameSession(input: FinishGameInput): FinishGameResult {
       try {
         const exists = db.prepare(`SELECT 1 FROM kg_nodes WHERE id=?`).get(a.kgNodeId);
         if (!exists) continue;
+        // 先取「更新前」的 rating 作为预测，再更新——这才是逐次口径的校准样本
+        const before = db.prepare(`SELECT rating FROM user_kp_proficiency WHERE user_id=? AND kg_node_id=?`)
+          .get(input.userId, a.kgNodeId) as { rating: number | null } | undefined;
+        recordCalibrationSample({
+          userId: input.userId,
+          kgNodeId: a.kgNodeId,
+          ratingBefore: before?.rating ?? 0,
+          correct: a.correct,
+          source: 'game',
+        });
         updateProficiency(input.userId, a.kgNodeId, a.correct ? 1 : 0, 1, 'game');
         updated++;
       } catch (e) {

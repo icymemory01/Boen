@@ -126,6 +126,12 @@ export const GameLeaderboardQuerySchema = z.object({
   period: z.enum(['week', 'all']).default('week'),
 });
 
+/** POST /api/consent/guardian —— 监护人同意（不满 14 周岁） */
+export const GuardianConsentSchema = z.object({
+  guardianName: z.string().max(40).optional(),
+  relationship: z.string().max(20).optional(),
+}).strict();
+
 /** REDEEM 积分兑换 */
 export const RedeemPointsSchema = z.object({
   productKey: z.string().min(1),

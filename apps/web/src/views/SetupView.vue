@@ -7,6 +7,7 @@ import { useAuthStore } from '@/stores/auth';
 import { getToken } from '@/services/auth';
 import { useToast } from '@/composables/useToast';
 import MembershipPanel from '@/components/MembershipPanel.vue';
+import GuardianConsentCard from '@/components/GuardianConsentCard.vue';
 const router = useRouter();
 const authStore = useAuthStore();
 const toast = useToast();
@@ -240,6 +241,8 @@ function handleBack() {
             </div>
           </div>
         </div>
+
+        <GuardianConsentCard />
 
         <div class="pb-8"></div>
       </div>

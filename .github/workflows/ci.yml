@@ -33,3 +33,9 @@ jobs:
 
       - name: Typecheck web
         run: node node_modules/vue-tsc/bin/vue-tsc.js --noEmit -p apps/web/tsconfig.json
+
+      # 运维脚本冒烟：确保用量报表与画像校准脚本在空库上也能跑通
+      - name: Ops scripts smoke
+        run: |
+          node node_modules/tsx/dist/cli.mjs apps/server/src/scripts/usage-report.ts --days=1
+          node node_modules/tsx/dist/cli.mjs apps/server/src/scripts/calibrate-profile.ts --json

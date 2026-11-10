@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GAME_QUESTION_BONUS, type GameMode } from '@boen/shared';
 import db from './db.js';
+import { createQueue } from './queue.js';
 import {
   LANE_COUNT,
   gradeLabel,
@@ -396,6 +397,12 @@ const POOL_MAX = 20;
 /** 单次补充最多生成的题数 */
 const REFILL_BATCH = 6;
 
+/**
+ * 出题预热队列：同一时刻最多 2 个 LLM 出题在跑，排队上限 60。
+ * 池子不足时前端会落到题库兜底，所以宁可排队也不要打满进程。
+ */
+const questionQueue = createQueue('game_question', 2, 60);
+
 interface PoolEntry {
   items: GameQuestion[];
   subject: GameSubject;
@@ -482,10 +489,10 @@ async function refillPool(entry: PoolEntry, preferKgNodeIds?: number[]): Promise
     while (entry.items.length < POOL_MAX && added < REFILL_BATCH) {
       let q: GameQuestion;
       try {
-        q = await generateGameQuestion(poolModel, entry.subject, {
+        q = await questionQueue.run(() => generateGameQuestion(poolModel!, entry.subject, {
           grade: entry.grade,
           preferKgNodeIds,
-        });
+        }));
       } catch {
         q = getFallbackQuestion(entry.subject, entry.grade);
       }

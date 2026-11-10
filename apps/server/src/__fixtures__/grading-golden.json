@@ -1,0 +1,114 @@
+{
+  "version": "2026-11-10",
+  "note": "简答题 LLM 判分的固定评测集：人工分由教研口径给出（0-100），用于回归与偏差监控。新增样本请同时补充 reference 与 humanScore。",
+  "items": [
+    {
+      "id": "math-01",
+      "subject": "math",
+      "grade": "8",
+      "stem": "说明为什么三角形内角和是 180°（用平行线性质解释）。",
+      "reference": "过三角形一个顶点作对边的平行线，利用两直线平行内错角相等，把三个内角转化为一个平角，因此和为 180°。",
+      "studentAnswer": "过一个顶点作平行线，内错角相等，三个角拼成平角，所以是 180 度。",
+      "humanScore": 90
+    },
+    {
+      "id": "math-02",
+      "subject": "math",
+      "grade": "8",
+      "stem": "解方程 2x + 6 = 0，并写出每一步的依据。",
+      "reference": "两边同时减 6 得 2x = -6，两边同时除以 2 得 x = -3（等式性质）。",
+      "studentAnswer": "2x = -6, x = -3",
+      "humanScore": 70
+    },
+    {
+      "id": "math-03",
+      "subject": "math",
+      "grade": "9",
+      "stem": "简述二次函数 y = x² 图象的开口方向、顶点与对称轴。",
+      "reference": "开口向上；顶点为原点 (0,0)；对称轴为 y 轴（x = 0）。",
+      "studentAnswer": "开口向上，顶点是原点，关于 y 轴对称。",
+      "humanScore": 95
+    },
+    {
+      "id": "chinese-01",
+      "subject": "chinese",
+      "grade": "7",
+      "stem": "说说“春风又绿江南岸”中“绿”字的表达效果。",
+      "reference": "“绿”是形容词作动词，写出春风吹过之后江南变绿的过程，化静为动，富有生机。",
+      "studentAnswer": "绿字把春天写活了，让江南变绿了。",
+      "humanScore": 65
+    },
+    {
+      "id": "chinese-02",
+      "subject": "chinese",
+      "grade": "8",
+      "stem": "《背影》中反复写父亲的“背影”，有什么作用？",
+      "reference": "以背影为线索贯穿全文，凝聚父爱，也表现“我”由不解到体谅的情感变化，含蓄而深沉。",
+      "studentAnswer": "背影是线索，表现了父爱。",
+      "humanScore": 60
+    },
+    {
+      "id": "chinese-03",
+      "subject": "chinese",
+      "grade": "9",
+      "stem": "简要概括《岳阳楼记》中“先忧后乐”的思想。",
+      "reference": "把国家和百姓的利益放在个人得失之前：忧在天下人之前，乐在天下人之后，体现政治抱负与胸襟。",
+      "studentAnswer": "先天下之忧而忧，后天下之乐而乐，把国家放在第一位。",
+      "humanScore": 85
+    },
+    {
+      "id": "english-01",
+      "subject": "english",
+      "grade": "8",
+      "stem": "用英语说明一般现在时与现在进行时的区别，各举一例。",
+      "reference": "一般现在时表示习惯或事实（I go to school by bike.）；现在进行时表示此刻正在发生（I am going to school now.）。",
+      "studentAnswer": "一般现在时 is habit: I go to school. 现在进行时 is doing now: I am going to school.",
+      "humanScore": 75
+    },
+    {
+      "id": "english-02",
+      "subject": "english",
+      "grade": "9",
+      "stem": "把“如果明天下雨，我们就待在家里”翻译成英文，并说明从句时态。",
+      "reference": "If it rains tomorrow, we will stay at home. 条件状语从句用一般现在时表将来（主将从现）。",
+      "studentAnswer": "If it will rain tomorrow, we will stay at home.",
+      "humanScore": 40
+    },
+    {
+      "id": "science-01",
+      "subject": "science",
+      "grade": "8",
+      "stem": "为什么夏天海边白天吹海风、夜晚吹陆风？",
+      "reference": "水的比热容大于陆地，白天陆地升温快形成低压，风从海洋吹向陆地；夜晚陆地降温快，风向相反。",
+      "studentAnswer": "水升温慢，白天陆地热空气上升，海上的风吹过来；晚上陆地冷得快，就反过来。",
+      "humanScore": 85
+    },
+    {
+      "id": "science-02",
+      "subject": "science",
+      "grade": "9",
+      "stem": "说明质量守恒定律，并解释为什么化学反应前后质量不变。",
+      "reference": "参加反应的各物质质量总和等于反应后生成的各物质质量总和；因为反应前后原子的种类、数目、质量都不变。",
+      "studentAnswer": "反应前后质量一样，因为原子没有消失也没有增加。",
+      "humanScore": 80
+    },
+    {
+      "id": "science-03",
+      "subject": "science",
+      "grade": "9",
+      "stem": "串联电路与并联电路中，电流和电压的规律分别是什么？",
+      "reference": "串联：电流处处相等，总电压等于各部分电压之和；并联：各支路电压相等，干路电流等于各支路电流之和。",
+      "studentAnswer": "串联电流一样，电压加起来；并联电压一样，电流加起来。",
+      "humanScore": 90
+    },
+    {
+      "id": "mixed-01",
+      "subject": "math",
+      "grade": "8",
+      "stem": "用自己的话解释“函数”是什么，并举一个生活中的例子。",
+      "reference": "对每一个自变量的值，都有唯一确定的因变量与之对应；例如出租车费随里程变化，同一里程对应唯一车费。",
+      "studentAnswer": "就是一个量变另一个量跟着变。",
+      "humanScore": 35
+    }
+  ]
+}
